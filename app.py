@@ -6,6 +6,7 @@ import json
 import math
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -59,8 +60,8 @@ def validate_position(lat: Any, lon: Any) -> tuple[float, float]:
     return lat, lon
 
 
-def json_dump(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True)
+def json_dump(value: Any, ensure_ascii: bool = False) -> str:
+    return json.dumps(value, ensure_ascii=ensure_ascii, sort_keys=True)
 
 
 class MaritimeSARService:
@@ -163,7 +164,98 @@ class MaritimeSARService:
                 );
                 CREATE INDEX IF NOT EXISTS idx_clues_incident ON clues(incident_id, recorded_at);
                 CREATE INDEX IF NOT EXISTS idx_timeline_incident ON timeline(incident_id, id);
+
+                CREATE TABLE IF NOT EXISTS incident_merges (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    merge_code TEXT NOT NULL UNIQUE,
+                    client_merge_id TEXT UNIQUE,
+                    primary_incident_id INTEGER NOT NULL REFERENCES incidents(id),
+                    duplicate_incident_id INTEGER NOT NULL REFERENCES incidents(id),
+                    status TEXT NOT NULL,
+                    expected_primary_version INTEGER,
+                    expected_duplicate_version INTEGER NOT NULL,
+                    pre_merge_snapshot TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    reversible INTEGER NOT NULL DEFAULT 1,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    undone_by TEXT,
+                    undone_at TEXT,
+                    undo_reason TEXT NOT NULL DEFAULT ''
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_active_merge_duplicate
+                    ON incident_merges(duplicate_incident_id) WHERE status='merged';
+
+                CREATE TABLE IF NOT EXISTS incident_merge_changes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    merge_id INTEGER NOT NULL REFERENCES incident_merges(id),
+                    record_type TEXT NOT NULL,
+                    record_id INTEGER NOT NULL,
+                    action TEXT NOT NULL,
+                    before_incident_id INTEGER,
+                    after_incident_id INTEGER,
+                    before_area_id INTEGER,
+                    before_assigned_asset_id INTEGER,
+                    before_area_status TEXT,
+                    before_version INTEGER,
+                    details TEXT NOT NULL DEFAULT '{}',
+                    undone INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_merge_changes_merge ON incident_merge_changes(merge_id, id);
+
+                CREATE TABLE IF NOT EXISTS incident_merge_conflicts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    merge_id INTEGER NOT NULL REFERENCES incident_merges(id),
+                    record_type TEXT NOT NULL,
+                    record_id INTEGER,
+                    code TEXT NOT NULL,
+                    severity TEXT NOT NULL DEFAULT 'review',
+                    status TEXT NOT NULL DEFAULT 'pending_review',
+                    details TEXT NOT NULL DEFAULT '{}',
+                    created_at TEXT NOT NULL,
+                    resolved_at TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_merge_conflicts_merge
+                    ON incident_merge_conflicts(merge_id, id);
                 """
+            )
+            self._backfill_legacy_merges(conn)
+
+    def _backfill_legacy_merges(self, conn: sqlite3.Connection) -> None:
+        """Preserve automatic duplicate markings already present in upgraded databases."""
+        now = utcnow()
+        rows = conn.execute(
+            """
+            SELECT child.* FROM incidents child
+            WHERE child.duplicate_of IS NOT NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM incident_merges m
+                  WHERE m.duplicate_incident_id=child.id AND m.merge_code LIKE 'legacy-%'
+              )
+            """
+        ).fetchall()
+        for child in rows:
+            snapshot = {"incident": dict(child)}
+            merge_code = "legacy-%s-%s" % (child["id"], uuid.uuid4().hex[:12])
+            cur = conn.execute(
+                """INSERT INTO incident_merges(merge_code,primary_incident_id,duplicate_incident_id,status,
+                   expected_duplicate_version,pre_merge_snapshot,reversible,created_by,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (merge_code, child["duplicate_of"], child["id"], "legacy", child["version"],
+                 json_dump(snapshot), 0, child["created_by"], child["created_at"]),
+            )
+            conn.execute(
+                """INSERT INTO incident_merge_conflicts(merge_id,record_type,record_id,code,severity,status,details,created_at,resolved_at)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (cur.lastrowid, "incident", child["id"], "legacy.duplicate_marking", "info",
+                 "historical", json_dump({"reason": "升级前自动识别的重复报警，仅供追溯"}, ensure_ascii=False),
+                 child["created_at"], now),
+            )
+            conn.execute(
+                "INSERT INTO timeline(incident_id,actor,action,details,created_at) VALUES(?,?,?,?,?)",
+                (child["id"], child["created_by"], "incident.merge_legacy_imported",
+                 json_dump({"merge_id": cur.lastrowid, "primary_incident_id": child["duplicate_of"]}, ensure_ascii=False), now),
             )
 
     def _audit(self, conn: sqlite3.Connection, incident_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
@@ -548,6 +640,379 @@ class MaritimeSARService:
             self._audit(conn, None, actor, "offline.batch_merged", {"batch_id": batch_id, **{k: summary[k] for k in ("accepted", "rejected")}})
             return {"batch_id": batch_id, "idempotent": False, "status": "merged", "summary": summary}
 
+    def _merge_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        result["reversible"] = bool(row["reversible"])
+        result["pre_merge_snapshot"] = json.loads(row["pre_merge_snapshot"])
+        return result
+
+    def _get_merge(self, conn: sqlite3.Connection, merge_id: int) -> sqlite3.Row | None:
+        return conn.execute("SELECT * FROM incident_merges WHERE id=?", (merge_id,)).fetchone()
+
+    def merge_duplicate_incident(self, actor: str, role: str, primary_incident_id: int,
+                                 duplicate_incident_id: int,
+                                 client_merge_id: str | None = None,
+                                 expected_primary_version: int | None = None,
+                                 expected_duplicate_version: int | None = None,
+                                 note: str = "") -> dict[str, Any]:
+        """Merge a duplicate into a primary incident without changing the primary's values."""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "归并重复事件")
+        primary_id, duplicate_id = int(primary_incident_id), int(duplicate_incident_id)
+        if primary_id == duplicate_id:
+            raise DomainError("主事件和从事件不能相同")
+        client_id = (client_merge_id or "").strip() or None
+        if client_id is not None and len(client_id) > 100:
+            raise DomainError("归并幂等编号过长")
+        note = note.strip()
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if client_id:
+                idempotent = conn.execute(
+                    "SELECT * FROM incident_merges WHERE client_merge_id=?", (client_id,)
+                ).fetchone()
+                if idempotent:
+                    if idempotent["duplicate_incident_id"] != duplicate_id or idempotent["primary_incident_id"] != primary_id:
+                        raise DomainError("归并幂等编号已用于其他事件", 409)
+                    return self._merge_dict(idempotent)
+
+            primary = conn.execute("SELECT * FROM incidents WHERE id=?", (primary_id,)).fetchone()
+            duplicate = conn.execute("SELECT * FROM incidents WHERE id=?", (duplicate_id,)).fetchone()
+            if not primary or not duplicate:
+                raise DomainError("主事件或从事件不存在", 404)
+            if primary["status"] not in ACTIVE_INCIDENT:
+                raise DomainError("主事件当前不是活动事件，不能接续资源", 409)
+            if duplicate["status"] not in ACTIVE_INCIDENT | {"duplicate"}:
+                raise DomainError("从事件已关闭，不能归并", 409)
+            if duplicate["duplicate_of"] is not None and duplicate["duplicate_of"] != primary_id:
+                raise DomainError("该从事件已指向其他主事件", 409)
+            if expected_primary_version is not None and primary["version"] != int(expected_primary_version):
+                raise DomainError("主事件已变化，请刷新后重试", 409)
+            if expected_duplicate_version is not None and duplicate["version"] != int(expected_duplicate_version):
+                raise DomainError("从事件已变化，请刷新后重试", 409)
+            if conn.execute(
+                "SELECT 1 FROM incident_merges WHERE primary_incident_id=? AND status='merged' LIMIT 1",
+                (duplicate_id,),
+            ).fetchone():
+                raise DomainError("从事件本身仍是其他事件的主事件，不能形成归并链", 409)
+            if conn.execute(
+                "SELECT 1 FROM incident_merges WHERE duplicate_incident_id=? AND status='merged' LIMIT 1",
+                (duplicate_id,),
+            ).fetchone():
+                raise DomainError("从事件已被其他协调员归并", 409)
+
+            now = utcnow()
+            merge_code = "merge-%s" % uuid.uuid4().hex
+            try:
+                merge_cur = conn.execute(
+                    """INSERT INTO incident_merges(merge_code,client_merge_id,primary_incident_id,duplicate_incident_id,
+                       status,expected_primary_version,expected_duplicate_version,pre_merge_snapshot,note,
+                       reversible,created_by,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,1,?,?)""",
+                    (merge_code, client_id, primary_id, duplicate_id, "merged",
+                     primary["version"] if expected_primary_version is not None else None,
+                     duplicate["version"],
+                     json_dump({"incident": dict(duplicate)}, ensure_ascii=False), note, actor, now),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise DomainError("从事件已被其他协调员归并", 409) from exc
+            merge_id = int(merge_cur.lastrowid)
+
+            held_area_ids: set[int] = set()
+            areas = conn.execute(
+                "SELECT * FROM search_areas WHERE incident_id=? ORDER BY priority,id",
+                (duplicate_id,),
+            ).fetchall()
+            for area in areas:
+                asset = None
+                conflict_code = None
+                conflict_detail: dict[str, Any] = {}
+                if area["assigned_asset_id"] is not None:
+                    asset = conn.execute(
+                        "SELECT * FROM assets WHERE id=?", (area["assigned_asset_id"],)
+                    ).fetchone()
+                    if not asset:
+                        conflict_code = "asset.missing"
+                        conflict_detail = {"reason": "已分配资源不存在"}
+                    elif asset["status"] != "assigned":
+                        conflict_code = "asset.unavailable"
+                        conflict_detail = {"reason": "资源当前不是已分配状态", "asset_status": asset["status"]}
+                    elif primary["sea_state"] > asset["max_sea_state"]:
+                        conflict_code = "asset.sea_state"
+                        conflict_detail = {
+                            "reason": "资源不能适应主事件海况",
+                            "primary_sea_state": primary["sea_state"],
+                            "asset_max_sea_state": asset["max_sea_state"],
+                        }
+                    else:
+                        capabilities = json.loads(asset["capabilities"])
+                        distance = haversine_km(
+                            asset["latitude"], asset["longitude"],
+                            area["center_lat"], area["center_lon"],
+                        )
+                        if area["kind"] not in capabilities:
+                            conflict_code = "asset.capability"
+                            conflict_detail = {"reason": "资源不具备区域搜索能力", "required": area["kind"], "capabilities": capabilities}
+                        elif distance > asset["range_km"]:
+                            conflict_code = "asset.range"
+                            conflict_detail = {
+                                "reason": "搜索区域超出资源航程",
+                                "distance_km": round(distance, 2),
+                                "range_km": asset["range_km"],
+                            }
+
+                if conflict_code is None:
+                    conn.execute(
+                        "UPDATE search_areas SET incident_id=?,version=version+1,updated_at=? WHERE id=?",
+                        (primary_id, now, area["id"]),
+                    )
+                    action = "continued" if asset is not None else "transferred"
+                    details = {}
+                    if asset is not None:
+                        distance = haversine_km(
+                            asset["latitude"], asset["longitude"], area["center_lat"], area["center_lon"]
+                        )
+                        details = {"asset_id": asset["id"], "distance_km": round(distance, 2)}
+                    conn.execute(
+                        """INSERT INTO incident_merge_changes(merge_id,record_type,record_id,action,
+                           before_incident_id,after_incident_id,before_assigned_asset_id,before_area_status,
+                           before_version,details,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (merge_id, "search_area", area["id"], action, duplicate_id, primary_id,
+                         area["assigned_asset_id"], area["status"], area["version"],
+                         json_dump(details, ensure_ascii=False), now),
+                    )
+                else:
+                    held_area_ids.add(area["id"])
+                    held_clues = conn.execute(
+                        "SELECT id FROM clues WHERE incident_id=? AND area_id=? ORDER BY id",
+                        (duplicate_id, area["id"]),
+                    ).fetchall()
+                    held_clue_ids = [row["id"] for row in held_clues]
+                    conflict_detail.update({
+                        "area_id": area["id"],
+                        "area_code": area["code"],
+                        "asset_id": area["assigned_asset_id"],
+                        "held_clue_ids": held_clue_ids,
+                    })
+                    conn.execute(
+                        "UPDATE search_areas SET assigned_asset_id=NULL,status='review_required',version=version+1,updated_at=? WHERE id=?",
+                        (now, area["id"]),
+                    )
+                    if asset is not None and asset["status"] == "assigned":
+                        conn.execute(
+                            "UPDATE assets SET status='available',version=version+1,updated_at=? WHERE id=?",
+                            (now, asset["id"]),
+                        )
+                    conn.execute(
+                        """INSERT INTO incident_merge_changes(merge_id,record_type,record_id,action,
+                           before_incident_id,after_incident_id,before_assigned_asset_id,before_area_status,
+                           before_version,details,created_at)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                        (merge_id, "search_area", area["id"], "held_for_review", duplicate_id, duplicate_id,
+                         area["assigned_asset_id"], area["status"], area["version"],
+                         json_dump({}, ensure_ascii=False), now),
+                    )
+                    if asset is not None and asset["status"] == "assigned":
+                        conn.execute(
+                            """INSERT INTO incident_merge_changes(merge_id,record_type,record_id,action,
+                               before_incident_id,after_incident_id,before_assigned_asset_id,before_area_status,
+                               before_version,details,created_at)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                            (merge_id, "asset", asset["id"], "released", duplicate_id, duplicate_id,
+                             asset["id"], area["status"], asset["version"],
+                             json_dump({"area_id": area["id"]}, ensure_ascii=False), now),
+                        )
+                    conn.execute(
+                        """INSERT INTO incident_merge_conflicts(merge_id,record_type,record_id,code,severity,
+                           status,details,created_at) VALUES(?,?,?,?,?,?,?,?)""",
+                        (merge_id, "search_area", area["id"], conflict_code, "review", "pending_review",
+                         json_dump(conflict_detail, ensure_ascii=False), now),
+                    )
+
+            clues = conn.execute("SELECT * FROM clues WHERE incident_id=? ORDER BY id", (duplicate_id,)).fetchall()
+            transferred_clues = held_clues = 0
+            for clue in clues:
+                if clue["area_id"] in held_area_ids:
+                    action, target_id, held_clues = "held_for_review", duplicate_id, held_clues + 1
+                else:
+                    action, target_id, transferred_clues = "transferred", primary_id, transferred_clues + 1
+                    conn.execute(
+                        "UPDATE clues SET incident_id=?,area_id=? WHERE id=?",
+                        (primary_id, clue["area_id"], clue["id"]),
+                    )
+                conn.execute(
+                    """INSERT INTO incident_merge_changes(merge_id,record_type,record_id,action,
+                       before_incident_id,after_incident_id,before_area_id,before_version,details,created_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (merge_id, "clue", clue["id"], action, duplicate_id, target_id,
+                     clue["area_id"], 0, json_dump({}, ensure_ascii=False), now),
+                )
+
+            conn.execute(
+                "UPDATE incidents SET duplicate_of=?,status='duplicate',version=version+1,updated_at=? WHERE id=?",
+                (primary_id, now, duplicate_id),
+            )
+            conflict_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM incident_merge_conflicts WHERE merge_id=?", (merge_id,)
+            ).fetchone()["c"]
+            transferred_area_count = conn.execute(
+                "SELECT COUNT(*) AS c FROM incident_merge_changes WHERE merge_id=? AND record_type='search_area' AND action IN ('transferred','continued')",
+                (merge_id,),
+            ).fetchone()["c"]
+            self._audit(conn, primary_id, actor, "incident.merged_duplicate", {
+                "merge_id": merge_id,
+                "duplicate_incident_id": duplicate_id,
+                "transferred_areas": transferred_area_count,
+                "transferred_clues": transferred_clues,
+                "held_clues": held_clues,
+                "conflicts": conflict_count,
+                "note": note,
+            })
+            self._audit(conn, duplicate_id, actor, "incident.merged_into", {
+                "merge_id": merge_id,
+                "primary_incident_id": primary_id,
+                "conflicts": conflict_count,
+            })
+            result = dict(conn.execute("SELECT * FROM incident_merges WHERE id=?", (merge_id,)).fetchone())
+            result["pre_merge_snapshot"] = json.loads(result["pre_merge_snapshot"])
+            result["reversible"] = True
+            result["changes"] = [dict(r) for r in conn.execute(
+                "SELECT * FROM incident_merge_changes WHERE merge_id=? ORDER BY id", (merge_id,)
+            ).fetchall()]
+            result["conflicts"] = [dict(r) for r in conn.execute(
+                "SELECT * FROM incident_merge_conflicts WHERE merge_id=? ORDER BY id", (merge_id,)
+            ).fetchall()]
+            return result
+
+    def undo_incident_merge(self, actor: str, role: str, merge_id: int | None = None,
+                            duplicate_incident_id: int | None = None,
+                            reason: str = "") -> dict[str, Any]:
+        """Restore ownership and versions captured by a reversible merge."""
+        actor = clean_actor(actor)
+        require_role(role, {"coordinator"}, "撤销重复事件归并")
+        if merge_id is None and duplicate_incident_id is None:
+            raise DomainError("必须提供 merge_id 或 duplicate_incident_id")
+        reason = reason.strip()
+
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            if merge_id is not None:
+                merge = self._get_merge(conn, int(merge_id))
+            else:
+                merge = conn.execute(
+                    "SELECT * FROM incident_merges WHERE duplicate_incident_id=? ORDER BY id DESC LIMIT 1",
+                    (int(duplicate_incident_id),),
+                ).fetchone()
+            if not merge:
+                raise DomainError("归并记录不存在", 404)
+            if merge["status"] == "undone":
+                return self._merge_dict(merge)
+            if merge["status"] != "merged":
+                raise DomainError("历史归并记录不能撤销", 409)
+            if not merge["reversible"]:
+                raise DomainError("升级前的历史归并不能自动撤销", 422)
+
+            merge_id = int(merge["id"])
+            duplicate_id = merge["duplicate_incident_id"]
+            primary_id = merge["primary_incident_id"]
+            snapshot = json.loads(merge["pre_merge_snapshot"])["incident"]
+            changes = conn.execute(
+                "SELECT * FROM incident_merge_changes WHERE merge_id=? ORDER BY id", (merge_id,)
+            ).fetchall()
+
+            for change in changes:
+                if change["record_type"] == "clue":
+                    clue = conn.execute("SELECT * FROM clues WHERE id=?", (change["record_id"],)).fetchone()
+                    if not clue:
+                        raise DomainError("线索 %s 已不存在，不能自动撤销" % change["record_id"], 409)
+                    if change["action"] == "transferred":
+                        if clue["incident_id"] != primary_id or clue["area_id"] != change["before_area_id"]:
+                            raise DomainError("线索 %s 在归并后已有后续变化" % clue["id"], 409)
+                elif change["record_type"] == "search_area":
+                    area = conn.execute("SELECT * FROM search_areas WHERE id=?", (change["record_id"],)).fetchone()
+                    if not area:
+                        raise DomainError("搜索区域 %s 已不存在，不能自动撤销" % change["record_id"], 409)
+                    if area["version"] != change["before_version"] + 1:
+                        raise DomainError("搜索区域 %s 在归并后已有后续操作" % area["code"], 409)
+                    if change["action"] in {"transferred", "continued"}:
+                        if area["incident_id"] != primary_id or area["assigned_asset_id"] != change["before_assigned_asset_id"]:
+                            raise DomainError("搜索区域 %s 在归并后已有后续变化" % area["code"], 409)
+                    elif change["action"] == "held_for_review":
+                        if area["incident_id"] != duplicate_id or area["assigned_asset_id"] is not None:
+                            raise DomainError("待复核区域 %s 已被处理，不能自动撤销" % area["code"], 409)
+                    if change["action"] in {"transferred", "continued"}:
+                        extra_area_clues = conn.execute(
+                            """SELECT COUNT(*) AS c FROM clues
+                               WHERE incident_id=? AND area_id=? AND id NOT IN (
+                                   SELECT record_id FROM incident_merge_changes
+                                   WHERE merge_id=? AND record_type='clue'
+                               ) LIMIT 1""",
+                            (primary_id, area["id"], merge_id),
+                        ).fetchone()["c"]
+                        if extra_area_clues:
+                            raise DomainError("区域 %s 归并后已有新线索，不能自动撤销" % area["code"], 409)
+                elif change["record_type"] == "asset" and change["action"] == "released":
+                    asset = conn.execute("SELECT * FROM assets WHERE id=?", (change["record_id"],)).fetchone()
+                    if not asset or asset["status"] != "available" or asset["version"] != change["before_version"] + 1:
+                        raise DomainError("资源 %s 已重新占用，不能自动撤销" % change["record_id"], 409)
+
+            now = utcnow()
+            for change in changes:
+                if change["record_type"] == "clue" and change["action"] == "transferred":
+                    conn.execute(
+                        "UPDATE clues SET incident_id=?,area_id=? WHERE id=?",
+                        (duplicate_id, change["before_area_id"], change["record_id"]),
+                    )
+                elif change["record_type"] == "search_area":
+                    if change["action"] in {"transferred", "continued"}:
+                        conn.execute(
+                            "UPDATE search_areas SET incident_id=?,version=? WHERE id=?",
+                            (duplicate_id, change["before_version"], change["record_id"]),
+                        )
+                    elif change["action"] == "held_for_review":
+                        conn.execute(
+                            "UPDATE search_areas SET incident_id=?,assigned_asset_id=?,status=?,version=? WHERE id=?",
+                            (duplicate_id, change["before_assigned_asset_id"], change["before_area_status"],
+                             change["before_version"], change["record_id"]),
+                        )
+                        asset_id = change["before_assigned_asset_id"]
+                        if asset_id is not None:
+                            conn.execute(
+                                "UPDATE assets SET status='assigned',version=? WHERE id=?",
+                                (change["before_version"], asset_id),
+                            )
+                        conn.execute(
+                            "UPDATE incident_merge_conflicts SET status='reverted',resolved_at=? WHERE merge_id=? AND record_type='search_area' AND record_id=?",
+                            (now, merge_id, change["record_id"]),
+                        )
+                conn.execute(
+                    "UPDATE incident_merge_changes SET undone=1 WHERE id=?", (change["id"],)
+                )
+
+            conn.execute(
+                """UPDATE incidents SET duplicate_of=?,status=?,version=?,updated_at=? WHERE id=?""",
+                (snapshot["duplicate_of"], snapshot["status"], snapshot["version"], now, duplicate_id),
+            )
+            conn.execute(
+                """UPDATE incident_merges SET status='undone',undone_by=?,undone_at=?,undo_reason=?
+                   WHERE id=?""",
+                (actor, now, reason, merge_id),
+            )
+            self._audit(conn, primary_id, actor, "incident.merge_undone", {
+                "merge_id": merge_id,
+                "duplicate_incident_id": duplicate_id,
+                "reason": reason,
+            })
+            self._audit(conn, duplicate_id, actor, "incident.merge_restored", {
+                "merge_id": merge_id,
+                "primary_incident_id": primary_id,
+                "restored_status": snapshot["status"],
+                "restored_version": snapshot["version"],
+            })
+            return self._merge_dict(conn.execute("SELECT * FROM incident_merges WHERE id=?", (merge_id,)).fetchone())
+
     def state(self, actor: str = "", role: str = "viewer") -> dict[str, Any]:
         with self.connect() as conn:
             incidents = [dict(r) for r in conn.execute("SELECT * FROM incidents ORDER BY id DESC").fetchall()]
@@ -555,7 +1020,25 @@ class MaritimeSARService:
             clues = [dict(r) for r in conn.execute("SELECT * FROM clues ORDER BY id DESC LIMIT 200").fetchall()]
             assets = [dict(r) for r in conn.execute("SELECT * FROM assets ORDER BY id").fetchall()]
             timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline ORDER BY id DESC LIMIT 300").fetchall()]
-        return {"incidents": incidents, "assets": assets, "search_areas": areas, "clues": clues, "timeline": timeline}
+            merges = []
+            merge_rows = conn.execute("SELECT * FROM incident_merges ORDER BY id DESC").fetchall()
+            for row in merge_rows:
+                merge = self._merge_dict(row)
+                merge["changes"] = [dict(r) for r in conn.execute(
+                    "SELECT * FROM incident_merge_changes WHERE merge_id=? ORDER BY id", (row["id"],)
+                ).fetchall()]
+                merge["conflicts"] = [dict(r) for r in conn.execute(
+                    "SELECT * FROM incident_merge_conflicts WHERE merge_id=? ORDER BY id", (row["id"],)
+                ).fetchall()]
+                merges.append(merge)
+        return {
+            "incidents": incidents,
+            "assets": assets,
+            "search_areas": areas,
+            "clues": clues,
+            "timeline": timeline,
+            "incident_merges": merges,
+        }
 
     def incident_timeline(self, incident_id: int) -> list[dict[str, Any]]:
         with self.connect() as conn:
@@ -655,6 +1138,10 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.close_incident(actor, role, **data)
             elif path == "/api/offline/batch":
                 result = self.service.merge_offline_batch(actor, role, **data)
+            elif path == "/api/incidents/merge":
+                result = self.service.merge_duplicate_incident(actor, role, **data)
+            elif path == "/api/incidents/merge/undo":
+                result = self.service.undo_incident_merge(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
