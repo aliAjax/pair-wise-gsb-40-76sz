@@ -1,8 +1,132 @@
 <!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>海上搜救协调</title>
-<style>body{font:15px/1.6 system-ui,sans-serif;max-width:1100px;margin:30px auto;padding:0 20px;color:#17324d}table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left}th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px}</style>
-<h1>海上搜救协调</h1><div class="card">页面读取实时状态。业务写入通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role</code>。</div>
-<h2>遇险事件</h2><table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
-<h2>资源</h2><table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>航程</th></tr></thead><tbody></tbody></table>
-<h2>搜索区域</h2><table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th></tr></thead><tbody></tbody></table>
-<h2>时间线</h2><ol id="timeline"></ol>
-<script>async function load(){const d=await fetch('/api/state').then(r=>r.json());const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>'<tr>'+cols.map(c=>`<td>${r[c]??''}</td>`).join('')+'</tr>').join('')};fill('incidents',d.incidents,['code','vessel_name','status','sea_state','lead_org','version']);fill('assets',d.assets,['name','kind','status','range_km']);fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id']);document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>`<li>${x.created_at} ${x.action} ${x.details}</li>`).join('')}load()</script></html>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1180px;margin:30px auto;padding:0 20px;color:#17324d}
+table{border-collapse:collapse;width:100%;margin:16px 0}th,td{border:1px solid #cbd8e3;padding:8px;text-align:left;vertical-align:top}
+th{background:#edf5fb}code{background:#f2f5f7;padding:2px 5px}
+.card{background:#f7fbfe;border-left:5px solid #2784c7;padding:12px 16px;margin:12px 0}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:12px;color:#fff}
+.s-applied{background:#2e8b57}.s-processing{background:#d99000}.s-revoked{background:#8a94a0}
+.s-duplicate{background:#9b59b6}.d-continued{background:#2e8b57}.d-review{background:#d9534f}
+.d-review_confirmed{background:#2e8b57}.d-review_rejected{background:#7f8c8d}.d-failed{background:#c0392b}.d-pending{background:#d99000}
+.merge-card{border:1px solid #cbd8e3;border-radius:8px;padding:12px 16px;margin:12px 0;background:#fff}
+.merge-card.revoked{background:#f5f6f7}
+.muted{color:#6b7d8f;font-size:13px}.ok{color:#2e8b57}.warn{color:#c0392b}
+h2{margin-top:32px}.itemrow td{font-size:13px}
+</style>
+<h1>海上搜救协调</h1>
+<div class="card">页面只读展示实时状态与<b>归并前后关系</b>。业务写入（含可撤销归并、复核、撤销）通过 README 中的 JSON API 完成，并需要 <code>X-User</code>、<code>X-Role: coordinator</code>。</div>
+
+<h2>遇险事件</h2>
+<table id="incidents"><thead><tr><th>编号</th><th>船名</th><th>状态 / 归并关系</th><th>海况</th><th>负责机构</th><th>版本</th></tr></thead><tbody></tbody></table>
+
+<h2>待复核队列 <span id="review-count" class="muted"></span></h2>
+<div id="review-queue" class="muted">加载中…</div>
+
+<h2>归并关系（前后可追溯）</h2>
+<div id="merges" class="muted">加载中…</div>
+
+<h2>资源</h2>
+<table id="assets"><thead><tr><th>名称</th><th>类型</th><th>状态</th><th>能力</th><th>航程</th><th>版本</th></tr></thead><tbody></tbody></table>
+
+<h2>搜索区域</h2>
+<table id="areas"><thead><tr><th>编号</th><th>事件</th><th>状态</th><th>优先级</th><th>资源</th><th>版本</th></tr></thead><tbody></tbody></table>
+
+<h2>线索（最近 200 条）</h2>
+<table id="clues"><thead><tr><th>#</th><th>事件</th><th>来源</th><th>状态</th><th>置信度</th><th>记录人</th><th>版本</th></tr></thead><tbody></tbody></table>
+
+<h2>时间线（最近 20 条）</h2><ol id="timeline"></ol>
+
+<script>
+const esc=s=>String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const badge=(cls,txt)=>`<span class="badge ${cls}">${esc(txt)}</span>`;
+const dispName={pending:'待处理',failed:'失败待恢复',continued:'已接续',review:'待复核',review_confirmed:'复核确认',review_rejected:'复核退回'};
+const mergeName={processing:'接续处理中',applied:'已归并',revoked:'已撤销'};
+
+function incidentCell(inc, byId, merges){
+  let rel='';
+  const active = (merges||[]).find(m=>m.merge.secondary_incident_id===inc.id && (m.merge.status==='applied'||m.merge.status==='processing'));
+  if(active){const p=byId.get(active.merge.primary_incident_id);
+    rel=` → 主事件 ${badge('s-'+active.merge.status, mergeName[active.merge.status])} ${p?esc(p.code):'#'+active.merge.primary_incident_id}`;
+  }else if(inc.status==='duplicate' && inc.duplicate_of){
+    const p=byId.get(inc.duplicate_of);
+    rel=` ${badge('s-duplicate','自动判重')} → ${p?esc(p.code):'#'+inc.duplicate_of}`;
+  }
+  const asPrimary=(merges||[]).filter(m=>m.merge.primary_incident_id===inc.id && m.merge.status==='applied').length;
+  if(asPrimary) rel += ` <span class="muted">（已并入 ${asPrimary} 个从事件）</span>`;
+  const st = inc.status==='duplicate'?badge('s-duplicate','duplicate'):esc(inc.status);
+  return st+rel;
+}
+
+async function load(){
+  const d=await fetch('/api/state').then(r=>r.json());
+  const byId=new Map(d.incidents.map(i=>[i.id,i]));
+  const codeOf=id=>{const i=byId.get(id);return i?i.code:('#'+id);};
+
+  // 事件
+  document.querySelector('#incidents tbody').innerHTML=d.incidents.map(i=>
+    `<tr><td>${esc(i.code)}</td><td>${esc(i.vessel_name)}</td><td>${incidentCell(i,byId,d.merges)}</td>
+     <td>${i.sea_state}</td><td>${esc(i.lead_org)}</td><td>v${i.version}</td></tr>`).join('');
+
+  const fill=(id,rows,cols)=>{document.querySelector('#'+id+' tbody').innerHTML=rows.map(r=>
+    '<tr>'+cols.map(c=>{let v=r[c]; if(c==='incident_id') v=esc(codeOf(r.incident_id))+' (#'+r.incident_id+')';
+      if(c==='capabilities'){try{v=JSON.parse(v).join('、')}catch(e){}}
+      return `<td>${esc(v)??''}</td>`;}).join('')+'</tr>').join('');};
+  fill('assets',d.assets,['name','kind','status','capabilities','range_km','version']);
+  fill('areas',d.search_areas,['code','incident_id','status','priority','assigned_asset_id','version']);
+  fill('clues',d.clues,['id','incident_id','source','status','confidence','reporter','version']);
+
+  document.querySelector('#timeline').innerHTML=d.timeline.slice(0,20).map(x=>
+    `<li>${x.created_at} <b>${esc(x.action)}</b> <span class="muted">事件 ${x.incident_id??'—'} · ${esc(x.actor)}</span><br>${esc(x.details)}</li>`).join('');
+
+  // 待复核队列：所有 applied 归并单中 disposition=review 的项
+  const queue=[];
+  (d.merges||[]).forEach(m=>m.items.forEach(it=>{
+    if(m.merge.status==='applied' && it.disposition==='review') queue.push({m,it});
+  }));
+  document.querySelector('#review-count').textContent=queue.length?`（${queue.length} 项）`:queue.length===0 && d.merges?.length?'（无）':'';
+  document.querySelector('#review-queue').innerHTML=queue.length?
+    `<table><thead><tr><th>归并单</th><th>类型</th><th>对象</th><th>冲突原因</th><th>归属事件</th></tr></thead><tbody>`+
+    queue.map(({m,it})=>{
+      const cur=it.current||{};
+      const label=it.item_type==='area'
+        ? `${esc(cur.code||('#'+it.item_id))}${it.asset?` · 船：${esc(it.asset.name)}`:''}`
+        : `线索 #${it.item_id} · ${esc(cur.source||'')}`;
+      return `<tr class="itemrow"><td>${esc(m.merge.code)} #${m.merge.id}</td><td>${it.item_type==='area'?'搜索区域':'线索'}</td>
+        <td>${label}</td><td class="warn">${esc(it.reason)}</td><td>${esc(codeOf(m.merge.primary_incident_id))}</td></tr>`;
+    }).join('')+`</tbody></table>
+    <div class="muted">处理方式：<code>POST /api/incidents/merge/review</code>，body 传 merge_id、item_type、item_id、resolution（confirmed/rejected）。</div>`
+    : '<div class="ok">当前没有待复核冲突项。</div>';
+
+  // 归并关系卡片：前（原归属）→ 后（现归属），撤销后展示恢复结果
+  const el=document.querySelector('#merges');
+  if(!d.merges || !d.merges.length){el.innerHTML='<div class="muted">暂无归并记录。</div>';return;}
+  el.innerHTML=d.merges.map(m=>{
+    const g=m.merge;
+    const rows=m.items.map(it=>{
+      const cur=it.current||{};
+      const who=it.item_type==='area'
+        ? `区域 ${esc(cur.code||('#'+it.item_id))}${it.asset?`（${esc(it.asset.name)}）`:''}`
+        : `线索 #${it.item_id}（${esc(cur.source||'')}）`;
+      const before=`${esc(codeOf(it.prev_incident_id))} · ${esc(it.prev_status)} · v${it.prev_version}`;
+      const after=cur.id?`${esc(codeOf(cur.incident_id))} · ${esc(cur.status)} · v${cur.version}`:'<span class="warn">记录已不存在</span>';
+      const rev=it.revoke_outcome?`<br><span class="${it.revoke_outcome==='restored'?'ok':'warn'}">撤销：${it.revoke_outcome==='restored'?'已恢复原归属与版本':esc(it.revoke_outcome)}</span>`:'';
+      const res=it.resolution?`<br><span class="muted">复核${it.resolution==='confirmed'?'确认':'退回'} by ${esc(it.resolved_by)}</span>`:'';
+      return `<tr class="itemrow"><td>${it.item_type==='area'?'🚢 区域':'🔎 线索'}</td><td>${who}</td>
+        <td>${before}</td><td>➜</td><td>${after}${res}${rev}</td>
+        <td>${badge('d-'+it.disposition, dispName[it.disposition]||it.disposition)}
+            ${it.reason?`<div class="muted">${esc(it.reason)}</div>`:''}
+            ${it.error?`<div class="warn">${esc(it.error)}</div>`:''}</td></tr>`;
+    }).join('');
+    const head=`<b>${esc(g.code)}</b> ${badge('s-'+g.status, mergeName[g.status]||g.status)}
+      从事件 <b>${esc(codeOf(g.secondary_incident_id))}</b> ➜ 主事件 <b>${esc(codeOf(g.primary_incident_id))}</b>
+      <span class="muted">· ${esc(g.actor)} · ${g.created_at}${g.applied_at?' · 接续完成 '+g.applied_at:''}${g.note?' · '+esc(g.note):''}</span>`;
+    const revoke=g.status==='revoked'
+      ?`<div class="muted">已由 ${esc(g.revoked_by)} 于 ${g.revoked_at} 撤销：${esc(g.revoke_reason)}（原状态 ${esc(g.prev_secondary_status)}、原版本 v${g.prev_secondary_version} 已恢复）</div>`
+      :`<div class="muted">撤销：<code>POST /api/incidents/merge/revoke</code>（merge_id=${g.id}, reason）；恢复/重试：<code>POST /api/incidents/merge/resume</code>。</div>`;
+    return `<div class="merge-card ${g.status==='revoked'?'revoked':''}">${head}${revoke}
+      <table><thead><tr><th>类型</th><th>对象</th><th>归并前（归属·状态·版本）</th><th></th><th>当前</th><th>处置</th></tr></thead>
+      <tbody>${rows||'<tr><td colspan="6" class="muted">该归并单无可接续项目。</td></tr>'}</tbody></table></div>`;
+  }).join('');
+}
+load();
+</script></html>

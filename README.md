@@ -25,8 +25,30 @@ python3 app.py
 - `POST /api/clues`、`POST /api/clues/verify`
 - `POST /api/assets/withdraw`：撤回资源并释放任务
 - `POST /api/incidents/transfer`、`POST /api/incidents/close`
+- `POST /api/incidents/merge`：可撤销归并重复事件（协调员选定主事件）
+- `POST /api/incidents/merge/resume`：恢复/重试未完成归并（幂等，不重复占船）
+- `POST /api/incidents/merge/revoke`：撤销归并，恢复从事件原归属与版本
+- `POST /api/incidents/merge/review`：复核待复核冲突项（confirmed/rejected）
+- `GET /api/merges`：归并台账（逐项前后关系、复核与撤销结果）
 - `POST /api/offline/batch`：幂等合并离线记录
 - `GET /api/incidents/{id}/timeline`
+
+## 可撤销归并
+
+`POST /api/incidents/merge` 的 body 包含 `primary_incident_id`、`secondary_incident_id`、
+`expected_secondary_version`（乐观锁）、`idempotency_key`、`note`。
+
+- 主事件自身字段不被修改；从事件的搜索区域、线索先逐项记入归并台账再接续。
+- 已派船区域按主事件海况、资源能力、航程重新校验：满足则带着原船接续（不重复派船、不释放船）；
+  不满足的区域和相对主事件位置异常的线索进入**待复核**。
+- 同一从事件同时只允许一个未撤销归并（`BEGIN IMMEDIATE` + 活跃归并检查）；
+  相同 `idempotency_key` 重试返回同一归并单。
+- 逐项处理、单项失败标记 `failed` 而不拖垮整单；`/resume` 以当前归属为基线对账后重跑，
+  已接续的项跳过，因此重试不会重复占船。
+- `/revoke` 恢复从事件原状态、原 `duplicate_of` 与原版本，以及未被改动项的原归属/状态/版本；
+  归并后被人工改动的项保留现状并逐项标注 `restored` 或 `kept:*`。撤销后允许重新归并，台账全部保留。
+- 旧数据库打开时自动迁移（`clues.version`、归并台账表），升级前的自动判重关系仍通过
+  `duplicate_of` 追溯，页面“归并关系”区展示每张归并单的前后归属、处置和撤销结果。
 
 ## 测试
 
